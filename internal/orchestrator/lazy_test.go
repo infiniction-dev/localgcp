@@ -40,6 +40,13 @@ func newMockRuntime() *mockRuntime {
 
 func (m *mockRuntime) Available() bool { return m.available }
 
+func (m *mockRuntime) RunToCompletion(ctx context.Context, cfg ContainerConfig) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.created = append(m.created, cfg)
+	return 0, nil
+}
+
 func (m *mockRuntime) Pull(ctx context.Context, img string) error {
 	if m.pullDelay > 0 {
 		select {
