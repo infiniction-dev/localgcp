@@ -30,14 +30,15 @@ type Service struct {
 }
 
 // New creates the Cloud Run emulator. runner executes Jobs tasks (a Docker-backed
-// runner for real execution, or a stub when Docker is unavailable).
-func New(dataDir string, quiet bool, runner job.Runner) *Service {
+// runner for real execution, or a stub when Docker is unavailable). seeds are
+// jobs to auto-register at startup (from --jobs).
+func New(dataDir string, quiet bool, runner job.Runner, seeds []job.SeedJob) *Service {
 	logger := log.New(os.Stderr, "[cloudrun] ", log.LstdFlags)
 	return &Service{
 		quiet:  quiet,
 		logger: logger,
 		svc:    service.New(),
-		jobs:   job.New(runner, logger),
+		jobs:   job.New(runner, logger, seeds),
 	}
 }
 

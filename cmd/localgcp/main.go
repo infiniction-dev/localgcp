@@ -43,6 +43,7 @@ func main() {
 
 func upCmd() *cobra.Command {
 	cfg := server.DefaultConfig()
+	var jobsFile string
 
 	cmd := &cobra.Command{
 		Use:   "up",
@@ -79,7 +80,11 @@ func upCmd() *cobra.Command {
 			srv.Register(vertexai.New(cfg.DataDir, cfg.Quiet, cfg.OllamaHost, cfg.VertexModelMap, cfg.VertexBackend, cfg.VertexAPIKey), cfg.PortVertexAI)
 			srv.Register(kms.New(cfg.DataDir, cfg.Quiet), cfg.PortKMS)
 			srv.Register(logging.New(cfg.DataDir, cfg.Quiet), cfg.PortLogging)
-			srv.Register(cloudrun.New(cfg.DataDir, cfg.Quiet, jobRunner), cfg.PortCloudRun)
+			seeds, err := job.LoadSeed(jobsFile)
+			if err != nil {
+				return err
+			}
+			srv.Register(cloudrun.New(cfg.DataDir, cfg.Quiet, jobRunner, seeds), cfg.PortCloudRun)
 
 			// Register orchestrated Docker services (opt-in via --services).
 			if cfg.Services != "" {
@@ -124,6 +129,7 @@ func upCmd() *cobra.Command {
 	cmd.Flags().IntVar(&cfg.PortKMS, "port-kms", cfg.PortKMS, "Port for Cloud KMS")
 	cmd.Flags().IntVar(&cfg.PortLogging, "port-logging", cfg.PortLogging, "Port for Cloud Logging")
 	cmd.Flags().IntVar(&cfg.PortCloudRun, "port-cloudrun", cfg.PortCloudRun, "Port for Cloud Run")
+	cmd.Flags().StringVar(&jobsFile, "jobs", "", "YAML file of Cloud Run Jobs to auto-register on startup")
 	cmd.Flags().StringVar(&cfg.OllamaHost, "ollama-host", cfg.OllamaHost, "Ollama API host for Vertex AI backend")
 	cmd.Flags().StringVar(&cfg.VertexModelMap, "vertex-model-map", "", "Model alias mapping (e.g. gemini-2.5-flash=llama3.2)")
 	cmd.Flags().StringVar(&cfg.VertexBackend, "vertex-backend", "", "Vertex AI backend: ollama (default), openai, anthropic, stub")

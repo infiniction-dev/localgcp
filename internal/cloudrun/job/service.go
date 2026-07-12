@@ -24,8 +24,18 @@ type Server struct {
 	store *Store
 }
 
-func New(runner Runner, logger *log.Logger) *Server {
-	return &Server{store: NewStore(runner, logger)}
+func New(runner Runner, logger *log.Logger, seeds []SeedJob) *Server {
+	s := &Server{store: NewStore(runner, logger)}
+	for _, sj := range seeds {
+		if _, err := s.store.CreateJob(sj.fullName(), sj.toJob()); err != nil {
+			if logger != nil {
+				logger.Printf("seed job %s: %v", sj.Name, err)
+			}
+		} else if logger != nil {
+			logger.Printf("seeded job %s", sj.fullName())
+		}
+	}
+	return s
 }
 
 // Register registers the Jobs, Executions and Tasks APIs on the gRPC server.

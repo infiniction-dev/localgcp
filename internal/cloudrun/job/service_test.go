@@ -70,7 +70,7 @@ func testClients(t *testing.T, runner Runner) (runpb.JobsClient, runpb.Execution
 		t.Fatalf("listen: %v", err)
 	}
 	srv := grpc.NewServer()
-	New(runner, nil).Register(srv)
+	New(runner, nil, nil).Register(srv)
 	go srv.Serve(ln)
 
 	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
