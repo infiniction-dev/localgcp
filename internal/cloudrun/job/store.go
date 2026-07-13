@@ -48,8 +48,7 @@ func NewStore(runner Runner, logger *log.Logger) *Store {
 	}
 }
 
-// ── Jobs ──────────────────────────────────────────────────────────────────────
-
+// --- Jobs ---
 func (s *Store) CreateJob(name string, job *runpb.Job) (*runpb.Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -59,6 +58,9 @@ func (s *Store) CreateJob(name string, job *runpb.Job) (*runpb.Job, error) {
 	}
 	if job == nil {
 		job = &runpb.Job{}
+	}
+	if err := validateEnv(containerEnv(job.GetTemplate().GetTemplate().GetContainers(), taskOverride{})); err != nil {
+		return nil, err
 	}
 
 	s.seq++
@@ -139,8 +141,7 @@ func (s *Store) DeleteJob(name string) (*runpb.Job, bool) {
 	return clone(job), true
 }
 
-// ── RunJob (asynchronous execution) ──────────────────────────────────────────
-
+// --- RunJob (asynchronous execution) ---
 // RunJob creates a RUNNING Execution (and its Tasks) for the named job and
 // launches the containers in the background. It returns a snapshot of the
 // freshly created (still running) Execution.
@@ -176,6 +177,19 @@ func (s *Store) RunJob(jobName string, ov *runpb.RunJobRequest_Overrides) (*runp
 		taskCount = ov.GetTaskCount()
 	}
 
+	var containers []*runpb.Container
+	if taskTemplate != nil {
+		containers = taskTemplate.GetContainers()
+	}
+	ovr := resolveOverride(ov, containers)
+
+	// Reject oversized environments up front (as real Cloud Run does), before
+	// creating an Execution — surfaces "payload passed via env" locally.
+	if err := validateEnv(containerEnv(containers, ovr)); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+
 	execID := fmt.Sprintf("%s-%s", lastSegment(jobName), nameSuffix(s.seq))
 	execName := jobName + "/executions/" + execID
 
@@ -202,10 +216,6 @@ func (s *Store) RunJob(jobName string, ov *runpb.RunJobRequest_Overrides) (*runp
 	}
 	s.executions[execName] = exec
 
-	var containers []*runpb.Container
-	if taskTemplate != nil {
-		containers = taskTemplate.GetContainers()
-	}
 	for i := int32(0); i < taskCount; i++ {
 		s.seq++
 		taskName := fmt.Sprintf("%s/tasks/%s-%d", execName, execID, i)
@@ -238,7 +248,6 @@ func (s *Store) RunJob(jobName string, ov *runpb.RunJobRequest_Overrides) (*runp
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancels[execName] = cancel
-	ovr := resolveOverride(ov, containers)
 	snapshot := clone(exec)
 	s.mu.Unlock()
 
@@ -370,8 +379,7 @@ func (s *Store) ListTasks(parent string) []*runpb.Task {
 	return result
 }
 
-// ── execution orchestration ──────────────────────────────────────────────────
-
+// --- execution orchestration ---
 // execute runs every task of an execution to completion, bounded by parallelism,
 // then finalises the execution's terminal state.
 func (s *Store) execute(ctx context.Context, execName, execID string, containers []*runpb.Container, taskCount, parallelism, maxRetries int32, ovr taskOverride) {
@@ -399,7 +407,8 @@ func (s *Store) runTask(ctx context.Context, execName, execID string, idx int32,
 	s.touchTaskStart(taskName)
 
 	var image string
-	var command, env []string
+	var command []string
+	env := containerEnv(containers, ovr)
 	if len(containers) > 0 {
 		c := containers[0]
 		image = c.GetImage()
@@ -413,12 +422,6 @@ func (s *Store) runTask(ctx context.Context, execName, execID string, idx int32,
 			args = ovr.args
 		}
 		command = append(append([]string{}, c.GetCommand()...), args...)
-
-		// env: job env, then override env (later entries win in Docker).
-		for _, e := range c.GetEnv() {
-			env = append(env, e.GetName()+"="+e.GetValue())
-		}
-		env = append(env, ovr.env...)
 	}
 
 	var exitCode int
@@ -546,8 +549,7 @@ func (s *Store) finalize(execName string) {
 	}
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
+// --- helpers ---
 func clone[T proto.Message](m T) T { return proto.Clone(m).(T) }
 
 func lastSegment(name string) string {

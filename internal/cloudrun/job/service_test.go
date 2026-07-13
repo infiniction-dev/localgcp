@@ -74,7 +74,7 @@ func testClients(t *testing.T, runner Runner) (runpb.JobsClient, runpb.Execution
 		t.Fatalf("listen: %v", err)
 	}
 	srv := grpc.NewServer()
-	New(runner, nil, nil).Register(srv)
+	New(runner, nil).Register(srv)
 	go srv.Serve(ln)
 
 	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -394,5 +394,62 @@ func TestNotFoundErrors(t *testing.T) {
 	}
 	if _, err := tasks.GetTask(ctx, &runpb.GetTaskRequest{Name: missing + "/executions/x/tasks/0"}); status.Code(err) != codes.NotFound {
 		t.Fatalf("GetTask: %v", err)
+	}
+}
+
+func TestValidateEnv(t *testing.T) {
+	if err := validateEnv([]string{"A=1", "B=hello"}); err != nil {
+		t.Fatalf("small env should pass: %v", err)
+	}
+	// Single oversized variable.
+	big := "PAYLOAD=" + strings.Repeat("x", maxEnvVarBytes)
+	if err := validateEnv([]string{big}); err == nil {
+		t.Fatal("expected error for oversized single var")
+	}
+	// Many vars exceeding the total.
+	var many []string
+	for i := 0; i < 12; i++ {
+		many = append(many, "V"+strings.Repeat("a", 100*1024)) // ~100 KiB each
+	}
+	if err := validateEnv(many); err == nil {
+		t.Fatal("expected error for oversized total env")
+	}
+}
+
+func TestRunJobRejectsOversizedOverrideEnv(t *testing.T) {
+	jobs, _, _, cleanup := testClients(t, &fakeRunner{})
+	defer cleanup()
+
+	job := createJob(t, jobs, "big", 1, 1, 0)
+	// 200 KiB payload in a per-dispatch override env (well under gRPC's 4 MiB,
+	// so the request reaches the server and hits env validation).
+	_, err := jobs.RunJob(context.Background(), &runpb.RunJobRequest{
+		Name: job.Name,
+		Overrides: &runpb.RunJobRequest_Overrides{
+			ContainerOverrides: []*runpb.RunJobRequest_Overrides_ContainerOverride{{
+				Env: []*runpb.EnvVar{{Name: "OUTBOX_PAYLOAD", Values: &runpb.EnvVar_Value{Value: strings.Repeat("x", 200*1024)}}},
+			}},
+		},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for oversized override env, got %v", err)
+	}
+}
+
+func TestCreateJobRejectsOversizedEnv(t *testing.T) {
+	jobs, _, _, cleanup := testClients(t, &fakeRunner{})
+	defer cleanup()
+
+	_, err := jobs.CreateJob(context.Background(), &runpb.CreateJobRequest{
+		Parent: parent, JobId: "bigdef",
+		Job: &runpb.Job{Template: &runpb.ExecutionTemplate{Template: &runpb.TaskTemplate{
+			Containers: []*runpb.Container{{
+				Image: "img",
+				Env:   []*runpb.EnvVar{{Name: "PAYLOAD", Values: &runpb.EnvVar_Value{Value: strings.Repeat("x", 200*1024)}}},
+			}},
+		}}},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for oversized job env, got %v", err)
 	}
 }
