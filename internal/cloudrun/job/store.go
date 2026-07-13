@@ -144,7 +144,7 @@ func (s *Store) DeleteJob(name string) (*runpb.Job, bool) {
 // RunJob creates a RUNNING Execution (and its Tasks) for the named job and
 // launches the containers in the background. It returns a snapshot of the
 // freshly created (still running) Execution.
-func (s *Store) RunJob(jobName string) (*runpb.Execution, error) {
+func (s *Store) RunJob(jobName string, ov *runpb.RunJobRequest_Overrides) (*runpb.Execution, error) {
 	s.mu.Lock()
 
 	job, ok := s.jobs[jobName]
@@ -169,6 +169,11 @@ func (s *Store) RunJob(jobName string) (*runpb.Execution, error) {
 			taskTemplate = inner
 			maxRetries = inner.GetMaxRetries()
 		}
+	}
+
+	// RunJob overrides (per-dispatch) take precedence over the job definition.
+	if ov.GetTaskCount() > 0 {
+		taskCount = ov.GetTaskCount()
 	}
 
 	execID := fmt.Sprintf("%s-%s", lastSegment(jobName), nameSuffix(s.seq))
@@ -233,12 +238,48 @@ func (s *Store) RunJob(jobName string) (*runpb.Execution, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancels[execName] = cancel
+	ovr := resolveOverride(ov, containers)
 	snapshot := clone(exec)
 	s.mu.Unlock()
 
-	go s.execute(ctx, execName, execID, containers, taskCount, parallelism, maxRetries)
+	go s.execute(ctx, execName, execID, containers, taskCount, parallelism, maxRetries, ovr)
 
 	return snapshot, nil
+}
+
+// taskOverride holds the per-dispatch container overrides resolved from a
+// RunJob request, applied on top of the job's container definition.
+type taskOverride struct {
+	env       []string // "KEY=VALUE" pairs; override or add over the job env
+	args      []string // replacement args (when set)
+	clearArgs bool     // drop the job's args
+}
+
+// resolveOverride picks the container override matching the task's container
+// (by name, else the first) and flattens it into a taskOverride.
+func resolveOverride(ov *runpb.RunJobRequest_Overrides, containers []*runpb.Container) taskOverride {
+	var res taskOverride
+	cos := ov.GetContainerOverrides()
+	if len(cos) == 0 {
+		return res
+	}
+	var targetName string
+	if len(containers) > 0 {
+		targetName = containers[0].GetName()
+	}
+	co := cos[0]
+	for _, c := range cos {
+		if c.GetName() == targetName {
+			co = c
+			break
+		}
+	}
+	for _, e := range co.GetEnv() {
+		res.env = append(res.env, e.GetName()+"="+e.GetValue())
+	}
+	res.args = co.GetArgs()
+	res.clearArgs = co.GetClearArgs()
+	return res
 }
 
 func (s *Store) GetExecution(name string) (*runpb.Execution, bool) {
@@ -333,7 +374,7 @@ func (s *Store) ListTasks(parent string) []*runpb.Task {
 
 // execute runs every task of an execution to completion, bounded by parallelism,
 // then finalises the execution's terminal state.
-func (s *Store) execute(ctx context.Context, execName, execID string, containers []*runpb.Container, taskCount, parallelism, maxRetries int32) {
+func (s *Store) execute(ctx context.Context, execName, execID string, containers []*runpb.Container, taskCount, parallelism, maxRetries int32, ovr taskOverride) {
 	if parallelism < 1 {
 		parallelism = 1
 	}
@@ -345,7 +386,7 @@ func (s *Store) execute(ctx context.Context, execName, execID string, containers
 		go func(idx int32) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			s.runTask(ctx, execName, execID, idx, containers, taskCount, maxRetries)
+			s.runTask(ctx, execName, execID, idx, containers, taskCount, maxRetries, ovr)
 		}(i)
 	}
 	wg.Wait()
@@ -353,7 +394,7 @@ func (s *Store) execute(ctx context.Context, execName, execID string, containers
 }
 
 // runTask runs a single task, retrying up to maxRetries, and records the outcome.
-func (s *Store) runTask(ctx context.Context, execName, execID string, idx int32, containers []*runpb.Container, taskCount, maxRetries int32) {
+func (s *Store) runTask(ctx context.Context, execName, execID string, idx int32, containers []*runpb.Container, taskCount, maxRetries int32, ovr taskOverride) {
 	taskName := fmt.Sprintf("%s/tasks/%s-%d", execName, execID, idx)
 	s.touchTaskStart(taskName)
 
@@ -362,10 +403,22 @@ func (s *Store) runTask(ctx context.Context, execName, execID string, idx int32,
 	if len(containers) > 0 {
 		c := containers[0]
 		image = c.GetImage()
-		command = append(append([]string{}, c.GetCommand()...), c.GetArgs()...)
+
+		// args: the job's args, unless the override clears or replaces them.
+		args := c.GetArgs()
+		if ovr.clearArgs {
+			args = nil
+		}
+		if len(ovr.args) > 0 {
+			args = ovr.args
+		}
+		command = append(append([]string{}, c.GetCommand()...), args...)
+
+		// env: job env, then override env (later entries win in Docker).
 		for _, e := range c.GetEnv() {
 			env = append(env, e.GetName()+"="+e.GetValue())
 		}
+		env = append(env, ovr.env...)
 	}
 
 	var exitCode int

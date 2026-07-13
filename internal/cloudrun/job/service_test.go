@@ -24,6 +24,8 @@ type fakeRunner struct {
 	active    int
 	maxActive int
 	delay     time.Duration
+	env       []string                            // Env seen on the most recent RunTask
+	command   []string                            // Command seen on the most recent RunTask
 	decide    func(idx, attempt int) (int, error) // nil => success
 }
 
@@ -37,6 +39,8 @@ func (f *fakeRunner) RunTask(ctx context.Context, spec TaskSpec) (int, error) {
 	if f.active > f.maxActive {
 		f.maxActive = f.active
 	}
+	f.env = spec.Env
+	f.command = spec.Command
 	f.mu.Unlock()
 	defer func() { f.mu.Lock(); f.active--; f.mu.Unlock() }()
 
@@ -276,6 +280,101 @@ func TestParallelismBounded(t *testing.T) {
 	if fr.maxActive != 2 {
 		t.Fatalf("expected max 2 concurrent tasks, got %d", fr.maxActive)
 	}
+}
+
+func TestRunJobOverridesEnvAndArgs(t *testing.T) {
+	fr := &fakeRunner{}
+	jobs, execs, _, cleanup := testClients(t, fr)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Job defined with a base env var and base args.
+	op, err := jobs.CreateJob(ctx, &runpb.CreateJobRequest{
+		Parent: parent, JobId: "ovr",
+		Job: &runpb.Job{Template: &runpb.ExecutionTemplate{
+			Template: &runpb.TaskTemplate{Containers: []*runpb.Container{{
+				Image: "img",
+				Args:  []string{"base-arg"},
+				Env:   []*runpb.EnvVar{{Name: "BASE", Values: &runpb.EnvVar_Value{Value: "1"}}},
+			}}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	var job runpb.Job
+	if err := op.GetResponse().UnmarshalTo(&job); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Per-dispatch overrides: extra env + replacement args.
+	runOp, err := jobs.RunJob(ctx, &runpb.RunJobRequest{
+		Name: job.Name,
+		Overrides: &runpb.RunJobRequest_Overrides{
+			ContainerOverrides: []*runpb.RunJobRequest_Overrides_ContainerOverride{{
+				Env: []*runpb.EnvVar{
+					{Name: "OUTBOX_MESSAGE_ID", Values: &runpb.EnvVar_Value{Value: "m1"}},
+				},
+				Args: []string{"run-arg"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunJob: %v", err)
+	}
+	var started runpb.Execution
+	runOp.GetResponse().UnmarshalTo(&started)
+	waitExec(t, execs, started.Name)
+
+	fr.mu.Lock()
+	env, command := fr.env, fr.command
+	fr.mu.Unlock()
+
+	if !hasEnv(env, "BASE=1") {
+		t.Fatalf("job base env dropped: %v", env)
+	}
+	if !hasEnv(env, "OUTBOX_MESSAGE_ID=m1") {
+		t.Fatalf("override env not applied: %v", env)
+	}
+	if !hasEnv(env, "CLOUD_RUN_TASK_INDEX=0") {
+		t.Fatalf("task env missing: %v", env)
+	}
+	if len(command) != 1 || command[0] != "run-arg" {
+		t.Fatalf("override args not applied: %v", command)
+	}
+}
+
+func TestRunJobOverridesTaskCount(t *testing.T) {
+	fr := &fakeRunner{}
+	jobs, execs, _, cleanup := testClients(t, fr)
+	defer cleanup()
+
+	job := createJob(t, jobs, "count", 1, 1, 0) // job defines 1 task
+	runOp, err := jobs.RunJob(context.Background(), &runpb.RunJobRequest{
+		Name:      job.Name,
+		Overrides: &runpb.RunJobRequest_Overrides{TaskCount: 4},
+	})
+	if err != nil {
+		t.Fatalf("RunJob: %v", err)
+	}
+	var started runpb.Execution
+	runOp.GetResponse().UnmarshalTo(&started)
+	if started.TaskCount != 4 {
+		t.Fatalf("override task_count not applied: got %d", started.TaskCount)
+	}
+	done := waitExec(t, execs, started.Name)
+	if done.SucceededCount != 4 {
+		t.Fatalf("expected 4 tasks run, got %d", done.SucceededCount)
+	}
+}
+
+func hasEnv(env []string, kv string) bool {
+	for _, e := range env {
+		if e == kv {
+			return true
+		}
+	}
+	return false
 }
 
 func TestNotFoundErrors(t *testing.T) {

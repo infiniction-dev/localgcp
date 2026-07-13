@@ -92,7 +92,7 @@ func (s *Server) DeleteJob(_ context.Context, req *runpb.DeleteJobRequest) (*lon
 // GetExecution to observe completion.
 func (s *Server) RunJob(_ context.Context, req *runpb.RunJobRequest) (*longrunning.Operation, error) {
 	name := req.GetName()
-	exec, err := s.store.RunJob(name)
+	exec, err := s.store.RunJob(name, req.GetOverrides())
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "Job %s not found", name)
 	}
