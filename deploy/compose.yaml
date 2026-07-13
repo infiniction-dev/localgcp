@@ -1,0 +1,30 @@
+# Local localgcp stack with Cloud Run Jobs that really execute.
+#
+# Prerequisite — build the worker image on the HOST Docker (the same daemon the
+# socket below points at), tagged as referenced in jobs.yaml:
+#   docker build -t demo-worker:local deploy/worker
+#
+# Then:  docker compose -f deploy/compose.yaml up -d --build
+services:
+  localgcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: localgcp:dev
+    # --jobs seeds jobs at startup; no --no-docker so Jobs run real containers.
+    command: ["up", "--jobs", "/etc/localgcp/jobs.yaml", "--data-dir", "/data"]
+    ports:
+      - "127.0.0.1:4443:4443"   # Cloud Storage    (STORAGE_EMULATOR_HOST)
+      - "127.0.0.1:8085:8085"   # Pub/Sub          (PUBSUB_EMULATOR_HOST)
+      - "127.0.0.1:8093:8093"   # Cloud Run + Jobs (manual endpoint)
+    volumes:
+      # Run job task containers on the host Docker daemon (siblings, not DinD).
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Declarative job definitions.
+      - ./jobs.yaml:/etc/localgcp/jobs.yaml:ro
+      # Persist native-service data across restarts.
+      - localgcp-data:/data
+    restart: unless-stopped
+
+volumes:
+  localgcp-data:
