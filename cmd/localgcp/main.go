@@ -10,6 +10,7 @@ import (
 
 	"github.com/slokam-ai/localgcp/internal/auth"
 	"github.com/slokam-ai/localgcp/internal/cloudrun"
+	"github.com/slokam-ai/localgcp/internal/cloudrun/job"
 	"github.com/slokam-ai/localgcp/internal/cloudtasks"
 	"github.com/slokam-ai/localgcp/internal/firestore"
 	"github.com/slokam-ai/localgcp/internal/gcs"
@@ -42,6 +43,7 @@ func main() {
 
 func upCmd() *cobra.Command {
 	cfg := server.DefaultConfig()
+	var jobsFile string
 
 	cmd := &cobra.Command{
 		Use:   "up",
@@ -55,6 +57,21 @@ func upCmd() *cobra.Command {
 			_ = credPath
 
 			srv := server.New(cfg)
+
+			// The Docker runtime is shared by Cloud Run Jobs (real task execution)
+			// and the orchestrated services. When Docker is unavailable, Jobs fall
+			// back to a stub runner so the control-plane API still works.
+			var dockerRuntime orchestrator.ContainerRuntime
+			var jobRunner job.Runner = job.StubRunner{}
+			if !cfg.NoDocker {
+				rt := orchestrator.NewDockerRuntime(log.New(os.Stderr, "[orchestrator] ", log.LstdFlags))
+				if rt.Available() {
+					rt.CleanupOrphans(cmd.Context(), "localgcp-")
+					dockerRuntime = rt
+					jobRunner = job.NewDockerRunner(rt)
+				}
+			}
+
 			srv.Register(gcs.New(cfg.DataDir, cfg.Quiet), cfg.PortGCS)
 			srv.Register(pubsub.New(cfg.DataDir, cfg.Quiet), cfg.PortPubSub)
 			srv.Register(secretmanager.New(cfg.DataDir, cfg.Quiet), cfg.PortSecretManager)
@@ -63,17 +80,17 @@ func upCmd() *cobra.Command {
 			srv.Register(vertexai.New(cfg.DataDir, cfg.Quiet, cfg.OllamaHost, cfg.VertexModelMap, cfg.VertexBackend, cfg.VertexAPIKey), cfg.PortVertexAI)
 			srv.Register(kms.New(cfg.DataDir, cfg.Quiet), cfg.PortKMS)
 			srv.Register(logging.New(cfg.DataDir, cfg.Quiet), cfg.PortLogging)
-			srv.Register(cloudrun.New(cfg.DataDir, cfg.Quiet), cfg.PortCloudRun)
+			seeds, err := job.LoadSeed(jobsFile)
+			if err != nil {
+				return err
+			}
+			srv.Register(cloudrun.New(cfg.DataDir, cfg.Quiet, jobRunner, seeds), cfg.PortCloudRun)
 
 			// Register orchestrated Docker services (opt-in via --services).
-			if cfg.Services != "" && !cfg.NoDocker {
-				runtime := orchestrator.NewDockerRuntime(log.New(os.Stderr, "[orchestrator] ", log.LstdFlags))
-				if !runtime.Available() {
+			if cfg.Services != "" {
+				if dockerRuntime == nil {
 					fmt.Fprintln(os.Stderr, "Warning: Docker not available; skipping orchestrated services")
 				} else {
-					// Clean up orphaned containers from crashed sessions.
-					runtime.CleanupOrphans(cmd.Context(), "localgcp-")
-
 					requested := strings.Split(cfg.Services, ",")
 					portMap := map[string]int{
 						"spanner":     cfg.PortSpanner,
@@ -93,7 +110,7 @@ func upCmd() *cobra.Command {
 							return fmt.Errorf("no port configured for %s", svcName)
 						}
 						ecfg = orchestrator.WithDataDir(ecfg, cfg.DataDir)
-						srv.Register(orchestrator.NewLazyService(ecfg.Name, ecfg, runtime), port)
+						srv.Register(orchestrator.NewLazyService(ecfg.Name, ecfg, dockerRuntime), port)
 					}
 				}
 			}
@@ -112,6 +129,7 @@ func upCmd() *cobra.Command {
 	cmd.Flags().IntVar(&cfg.PortKMS, "port-kms", cfg.PortKMS, "Port for Cloud KMS")
 	cmd.Flags().IntVar(&cfg.PortLogging, "port-logging", cfg.PortLogging, "Port for Cloud Logging")
 	cmd.Flags().IntVar(&cfg.PortCloudRun, "port-cloudrun", cfg.PortCloudRun, "Port for Cloud Run")
+	cmd.Flags().StringVar(&jobsFile, "jobs", "", "YAML file of Cloud Run Jobs to auto-register on startup")
 	cmd.Flags().StringVar(&cfg.OllamaHost, "ollama-host", cfg.OllamaHost, "Ollama API host for Vertex AI backend")
 	cmd.Flags().StringVar(&cfg.VertexModelMap, "vertex-model-map", "", "Model alias mapping (e.g. gemini-2.5-flash=llama3.2)")
 	cmd.Flags().StringVar(&cfg.VertexBackend, "vertex-backend", "", "Vertex AI backend: ollama (default), openai, anthropic, stub")

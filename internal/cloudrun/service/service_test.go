@@ -1,4 +1,4 @@
-package cloudrun
+package service
 
 import (
 	"context"
@@ -12,13 +12,12 @@ import (
 
 func testClient(t *testing.T) (runpb.ServicesClient, func()) {
 	t.Helper()
-	svc := New("", true)
 	ln, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	srv := grpc.NewServer()
-	runpb.RegisterServicesServer(srv, svc)
+	New().Register(srv)
 	go srv.Serve(ln)
 
 	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))

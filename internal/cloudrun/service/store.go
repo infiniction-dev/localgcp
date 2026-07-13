@@ -1,4 +1,4 @@
-package cloudrun
+package service
 
 import (
 	"fmt"

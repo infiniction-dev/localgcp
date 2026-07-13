@@ -1,8 +1,9 @@
 // Smoke test for localgcp — exercises all 4 services using official GCP client libraries.
 //
 // Usage:
-//   Terminal 1:  ./localgcp up
-//   Terminal 2:  go run ./examples/smoketest/
+//
+//	Terminal 1:  ./localgcp up
+//	Terminal 2:  go run ./examples/smoketest/
 package main
 
 import (
@@ -15,9 +16,11 @@ import (
 
 	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/pubsub"
-	"cloud.google.com/go/storage"
+	run "cloud.google.com/go/run/apiv2"
+	"cloud.google.com/go/run/apiv2/runpb"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
+	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
@@ -25,11 +28,12 @@ import (
 )
 
 const (
-	project  = "localgcp-test"
-	gcsPort  = "localhost:4443"
-	psPort   = "localhost:8085"
-	smPort   = "localhost:8086"
-	fsPort   = "localhost:8088"
+	project = "localgcp-test"
+	gcsPort = "localhost:4443"
+	psPort  = "localhost:8085"
+	smPort  = "localhost:8086"
+	fsPort  = "localhost:8088"
+	crPort  = "localhost:8093"
 )
 
 var (
@@ -49,13 +53,14 @@ func main() {
 	os.Setenv("PUBSUB_EMULATOR_HOST", psPort)
 	os.Setenv("FIRESTORE_EMULATOR_HOST", fsPort)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	testGCS(ctx)
 	testPubSub(ctx)
 	testSecretManager(ctx)
 	testFirestore(ctx)
+	testCloudRunJobs(ctx)
 
 	fmt.Println()
 	fmt.Println("===========================================")
@@ -315,9 +320,9 @@ func testFirestore(ctx context.Context) {
 
 	// Create document.
 	doc, _, err := col.Add(ctx, map[string]interface{}{
-		"name":  "Alice",
-		"age":   30,
-		"city":  "Seattle",
+		"name": "Alice",
+		"age":  30,
+		"city": "Seattle",
 	})
 	check("Create document", err)
 
@@ -394,4 +399,116 @@ func testFirestore(ctx context.Context) {
 	}
 
 	fmt.Println()
+}
+
+// ──────────────────────────────────────────────
+// Cloud Run Jobs
+// ──────────────────────────────────────────────
+
+func testCloudRunJobs(ctx context.Context) {
+	fmt.Println("[Cloud Run Jobs]")
+
+	opts := []option.ClientOption{
+		option.WithEndpoint(crPort),
+		option.WithoutAuthentication(),
+		option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+	}
+
+	jobsClient, err := run.NewJobsClient(ctx, opts...)
+	if !check("Connect Jobs", err) {
+		return
+	}
+	defer jobsClient.Close()
+
+	execClient, err := run.NewExecutionsClient(ctx, opts...)
+	if !check("Connect Executions", err) {
+		return
+	}
+	defer execClient.Close()
+
+	parent := fmt.Sprintf("projects/%s/locations/us-central1", project)
+	jobName := parent + "/jobs/smoke-job"
+
+	// Create a job with 2 tasks.
+	createOp, err := jobsClient.CreateJob(ctx, &runpb.CreateJobRequest{
+		Parent: parent,
+		JobId:  "smoke-job",
+		Job: &runpb.Job{
+			Template: &runpb.ExecutionTemplate{
+				TaskCount: 2,
+				Template: &runpb.TaskTemplate{
+					Containers: []*runpb.Container{{
+						Image:   "alpine:3.21",
+						Command: []string{"/bin/sh", "-c", "echo \"task $CLOUD_RUN_TASK_INDEX/$CLOUD_RUN_TASK_COUNT\"; exit 0"},
+					}},
+				},
+			},
+		},
+	})
+	if !check("Create job", err) {
+		return
+	}
+	if _, err := createOp.Wait(ctx); !check("Create job (operation Wait)", err) {
+		return
+	}
+
+	// Get the job back.
+	_, err = jobsClient.GetJob(ctx, &runpb.GetJobRequest{Name: jobName})
+	check("Get job", err)
+
+	// Run the job. RunJob returns a RUNNING execution immediately; poll
+	// GetExecution until it completes, as `gcloud run jobs execute --wait` does.
+	runOp, err := jobsClient.RunJob(ctx, &runpb.RunJobRequest{Name: jobName})
+	if !check("Run job", err) {
+		return
+	}
+	started, err := runOp.Wait(ctx)
+	if !check("Run job (operation Wait resolves Execution)", err) {
+		return
+	}
+
+	exec := pollExecution(ctx, execClient, started.Name)
+	if exec == nil {
+		check("Execution completes", fmt.Errorf("timed out waiting for %s", started.Name))
+		return
+	}
+	if exec.GetSucceededCount() == 2 && exec.GetFailedCount() == 0 {
+		check("Execution ran 2 tasks to success", nil)
+	} else {
+		check("Execution ran 2 tasks to success",
+			fmt.Errorf("succeeded=%d failed=%d", exec.GetSucceededCount(), exec.GetFailedCount()))
+	}
+
+	// List executions for the job.
+	execIt := execClient.ListExecutions(ctx, &runpb.ListExecutionsRequest{Parent: jobName})
+	if _, err := execIt.Next(); !check("List executions", err) {
+		return
+	}
+
+	// Clean up.
+	delOp, err := jobsClient.DeleteJob(ctx, &runpb.DeleteJobRequest{Name: jobName})
+	if !check("Delete job", err) {
+		return
+	}
+	_, err = delOp.Wait(ctx)
+	check("Delete job (operation Wait)", err)
+
+	fmt.Println()
+}
+
+// pollExecution polls GetExecution until its Completed condition is terminal.
+func pollExecution(ctx context.Context, c *run.ExecutionsClient, name string) *runpb.Execution {
+	for i := 0; i < 300; i++ {
+		e, err := c.GetExecution(ctx, &runpb.GetExecutionRequest{Name: name})
+		if err != nil {
+			return nil
+		}
+		if conds := e.GetConditions(); len(conds) > 0 {
+			if s := conds[0].GetState(); s == runpb.Condition_CONDITION_SUCCEEDED || s == runpb.Condition_CONDITION_FAILED {
+				return e
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil
 }

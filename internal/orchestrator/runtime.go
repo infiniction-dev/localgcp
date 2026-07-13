@@ -33,17 +33,22 @@ type ContainerRuntime interface {
 	HostPort(ctx context.Context, id string, containerPort string) (string, error)
 	FindExisting(ctx context.Context, name string) (string, bool, error)
 	CleanupOrphans(ctx context.Context, prefix string) error
+	// RunToCompletion creates and starts a container, blocks until it exits,
+	// and returns its exit code. The container is always removed before return.
+	// Unlike Create/Start (used for long-running proxied services), this is for
+	// run-to-completion workloads such as Cloud Run Jobs tasks.
+	RunToCompletion(ctx context.Context, cfg ContainerConfig) (int, error)
 }
 
 // ContainerConfig holds the parameters for creating a container.
 type ContainerConfig struct {
-	Name          string            // container name (e.g. "localgcp-spanner")
-	Image         string            // Docker image (e.g. "gcr.io/cloud-spanner-emulator/emulator:1.5.23")
-	InternalPort  string            // port inside container (e.g. "9010/tcp")
-	Cmd           []string          // optional command override
-	Env           []string          // environment variables
-	Volumes       map[string]string // host path -> container path (for data persistence)
-	DataPath      string            // container-internal data directory (for WithDataDir)
+	Name         string            // container name (e.g. "localgcp-spanner")
+	Image        string            // Docker image (e.g. "gcr.io/cloud-spanner-emulator/emulator:1.5.23")
+	InternalPort string            // port inside container (e.g. "9010/tcp")
+	Cmd          []string          // optional command override
+	Env          []string          // environment variables
+	Volumes      map[string]string // host path -> container path (for data persistence)
+	DataPath     string            // container-internal data directory (for WithDataDir)
 }
 
 // DockerRuntime implements ContainerRuntime using the Docker Go SDK.
@@ -227,6 +232,53 @@ func (d *DockerRuntime) Create(ctx context.Context, cfg ContainerConfig) (string
 
 func (d *DockerRuntime) Start(ctx context.Context, id string) error {
 	return d.cli.ContainerStart(ctx, id, container.StartOptions{})
+}
+
+func (d *DockerRuntime) RunToCompletion(ctx context.Context, cfg ContainerConfig) (int, error) {
+	containerCfg := &container.Config{
+		Image: cfg.Image,
+		Cmd:   cfg.Cmd,
+		Env:   cfg.Env,
+	}
+	hostCfg := &container.HostConfig{}
+	if len(cfg.Volumes) > 0 {
+		var binds []string
+		for hostPath, containerPath := range cfg.Volumes {
+			binds = append(binds, hostPath+":"+containerPath)
+		}
+		hostCfg.Binds = binds
+	}
+
+	create := func() (string, error) {
+		resp, err := d.cli.ContainerCreate(ctx, containerCfg, hostCfg, nil, nil, cfg.Name)
+		return resp.ID, err
+	}
+
+	id, err := create()
+	if err != nil {
+		// The image may not be present locally; pull once and retry.
+		if perr := d.Pull(ctx, cfg.Image); perr != nil {
+			return -1, fmt.Errorf("container create %s: %w", cfg.Name, err)
+		}
+		if id, err = create(); err != nil {
+			return -1, fmt.Errorf("container create %s: %w", cfg.Name, err)
+		}
+	}
+	defer d.cli.ContainerRemove(context.WithoutCancel(ctx), id, container.RemoveOptions{Force: true})
+
+	if err := d.cli.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
+		return -1, fmt.Errorf("container start %s: %w", cfg.Name, err)
+	}
+
+	statusCh, errCh := d.cli.ContainerWait(ctx, id, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		return -1, fmt.Errorf("container wait %s: %w", cfg.Name, err)
+	case status := <-statusCh:
+		return int(status.StatusCode), nil
+	case <-ctx.Done():
+		return -1, ctx.Err()
+	}
 }
 
 func (d *DockerRuntime) Stop(ctx context.Context, id string) error {
