@@ -1,9 +1,0 @@
-# Jobs auto-registered on `localgcp up --jobs`. See deploy/worker for the image.
-jobs:
-  - name: report
-    project: demo
-    region: us-central1
-    image: demo-worker:local   # build on host: docker build -t demo-worker:local deploy/worker
-    tasks: 2
-    parallelism: 2
-    maxRetries: 0
