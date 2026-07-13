@@ -5,3 +5,6 @@ dist/
 *.exe
 .claude/
 .omx/
+
+# Local deploy: consumer-provided job seed (not part of the tool)
+deploy/jobs.yaml

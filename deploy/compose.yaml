@@ -1,0 +1,40 @@
+# Run localgcp from the published image with your own job definitions.
+#
+#   docker login ghcr.io                          # private image: read:packages PAT
+#   # put your jobs.yaml next to this file, then:
+#   docker compose -f deploy/compose.yaml up -d
+#
+# Jobs run real containers on the host Docker daemon (mounted socket), so the
+# images your jobs reference must exist on the host — built locally or pulled
+# from your registry (e.g. `gcloud auth configure-docker` for Artifact Registry).
+services:
+  localgcp:
+    image: ghcr.io/infiniction-dev/localgcp:latest   # externally built (Release -> GHCR)
+    command: ["up", "--jobs", "/etc/localgcp/jobs.yaml", "--data-dir", "/data"]
+    ports:
+      - "127.0.0.1:4443:4443"   # Cloud Storage    (STORAGE_EMULATOR_HOST)
+      - "127.0.0.1:8085:8085"   # Pub/Sub          (PUBSUB_EMULATOR_HOST)
+      - "127.0.0.1:8093:8093"   # Cloud Run + Jobs (manual endpoint)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # run job containers on the host
+      - ./jobs.yaml:/etc/localgcp/jobs.yaml:ro       # YOUR job definitions (required)
+      - localgcp-data:/data                          # persist native-service data
+    restart: unless-stopped
+
+volumes:
+  localgcp-data:
+
+# jobs.yaml format:
+#   jobs:
+#     - name: my-job          # required
+#       image: my-image:tag   # required; must exist on the host daemon
+#       command: ["/app/run"] # optional (defaults to the image CMD)
+#       args: ["--flag"]      # optional
+#       env: { KEY: value }   # optional
+#       tasks: 1              # optional (default 1)
+#       parallelism: 1        # optional (default 1)
+#       maxRetries: 0         # optional (default 0)
+#
+# Local dev of localgcp itself? Build from source instead of pulling by
+# replacing the `image:` line above with:
+#   build: { context: .., dockerfile: deploy/Dockerfile }
