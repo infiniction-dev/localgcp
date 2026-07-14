@@ -17,7 +17,6 @@ import (
 	"github.com/slokam-ai/localgcp/internal/kms"
 	"github.com/slokam-ai/localgcp/internal/logging"
 	"github.com/slokam-ai/localgcp/internal/orchestrator"
-	"github.com/slokam-ai/localgcp/internal/pubsub"
 	"github.com/slokam-ai/localgcp/internal/secretmanager"
 	"github.com/slokam-ai/localgcp/internal/server"
 	"github.com/slokam-ai/localgcp/internal/vertexai"
@@ -71,8 +70,21 @@ func upCmd() *cobra.Command {
 				}
 			}
 
+			// GCS is the embedded fake-gcs-server. It publishes bucket
+			// notificationConfigs events through the Google Pub/Sub client, which
+			// honors PUBSUB_EMULATOR_HOST — point it at our Pub/Sub emulator so
+			// notifications land there.
+			os.Setenv("PUBSUB_EMULATOR_HOST", fmt.Sprintf("localhost:%d", cfg.PortPubSub))
 			srv.Register(gcs.New(cfg.DataDir, cfg.Quiet), cfg.PortGCS)
-			srv.Register(pubsub.New(cfg.DataDir, cfg.Quiet), cfg.PortPubSub)
+
+			// Pub/Sub is the official Google emulator, run as a container.
+			if dockerRuntime != nil {
+				srv.Register(orchestrator.NewLazyService(
+					orchestrator.PubSubConfig.Name, orchestrator.PubSubConfig, dockerRuntime),
+					cfg.PortPubSub)
+			} else {
+				fmt.Fprintln(os.Stderr, "Warning: Docker not available; Pub/Sub emulator will not start")
+			}
 			srv.Register(secretmanager.New(cfg.DataDir, cfg.Quiet), cfg.PortSecretManager)
 			srv.Register(firestore.New(cfg.DataDir, cfg.Quiet), cfg.PortFirestore)
 			srv.Register(cloudtasks.New(cfg.DataDir, cfg.Quiet), cfg.PortCloudTasks)
