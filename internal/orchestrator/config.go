@@ -22,6 +22,17 @@ var (
 		DataPath:     "", // Bigtable emulator doesn't support persistence
 	}
 
+	// PubSubConfig runs the official Google Pub/Sub emulator (bundled in the
+	// Cloud SDK image). It has no on-disk persistence, so topics, subscriptions
+	// and messages are reset when the container restarts.
+	PubSubConfig = ContainerConfig{
+		Name:         "localgcp-pubsub",
+		Image:        "gcr.io/google.com/cloudsdktool/cloud-sdk:emulators",
+		InternalPort: "8085/tcp",
+		Cmd:          []string{"gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085"},
+		DataPath:     "", // Pub/Sub emulator doesn't support persistence
+	}
+
 	CloudSQLConfig = ContainerConfig{
 		Name:         "localgcp-cloudsql",
 		Image:        "postgres:16-alpine",
